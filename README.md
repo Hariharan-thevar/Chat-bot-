@@ -1,1 +1,3 @@
-# Chat-bot-
+# ChatGPT Clone (Gemini)
+
+See README in canvas.
