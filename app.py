@@ -7,15 +7,14 @@ from typing import Any, Callable, List, Tuple
 from flask import Flask, request, jsonify, render_template, send_file
 from flask_cors import CORS
 
-# Optional: load .env locally for development
+# Optional .env for local testing
 try:
     from dotenv import load_dotenv
-
     load_dotenv()
 except Exception:
     pass
 
-# Import google generative client (may be missing/different versions)
+# Try import google generative client
 try:
     import google.generativeai as genai  # type: ignore
 except Exception:
@@ -26,62 +25,38 @@ CORS(app)
 logging.basicConfig(level=logging.INFO)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-MODEL_NAME = os.getenv("MODEL_NAME", "gemini-pro")  # default to gemini-pro (older runtimes)
+MODEL_NAME = os.getenv("MODEL_NAME", "gemini-pro")  # default to gemini-pro
 _model = None
 
 if GEMINI_API_KEY and genai is not None:
     try:
         genai.configure(api_key=GEMINI_API_KEY)
-        logging.info("Configured genai with API key (not shown).")
-        # Try to create a model handle if available
+        logging.info("Configured genai with API key.")
         try:
-            # Many versions expose GenerativeModel
             _model = getattr(genai, "GenerativeModel", lambda *a, **k: None)(MODEL_NAME)
-            if _model is None:
-                # fallback: some libraries accept a factory
-                logging.info("GenerativeModel returned None or not supported in this client.")
+            if _model:
+                logging.info("Created GenerativeModel handle for: %s", MODEL_NAME)
             else:
-                logging.info("Created model handle for: %s", MODEL_NAME)
+                logging.info("GenerativeModel handle unavailable (client may not expose it).")
         except Exception:
-            logging.exception("Could not create a GenerativeModel handle (this is OK).")
+            logging.exception("Failed to create GenerativeModel handle (continuing with genai-level fallbacks).")
             _model = None
     except Exception:
-        logging.exception("Failed to configure genai (check GEMINI_API_KEY and client).")
+        logging.exception("Failed to configure genai (check GEMINI_API_KEY).")
 else:
     if GEMINI_API_KEY and genai is None:
-        logging.warning("GEMINI_API_KEY present but google.generativeai is not importable.")
+        logging.warning("GEMINI_API_KEY set but google.generativeai import failed.")
     else:
-        logging.warning("GEMINI_API_KEY not set; /chat will return an informative error.")
+        logging.warning("GEMINI_API_KEY not set; /chat will return an error until you add it.")
 
 
 SYSTEM_PROMPT = "You are a helpful assistant."
 
 
-def _try_calls(fn: Callable[..., Any], arg_variants: List[dict]) -> Tuple[bool, Any, Exception]:
-    """
-    Try calling fn with each variant dict in arg_variants.
-    Returns (success, response, last_exception)
-    """
-    last_exc: Exception = None  # type: ignore
-    for args in arg_variants:
-        try:
-            logging.info("Trying %s with args %s", getattr(fn, "__name__", str(fn)), args)
-            resp = fn(**args) if isinstance(args, dict) else fn(args)
-            return True, resp, None
-        except Exception as e:
-            last_exc = e
-            logging.info("Attempt failed: %s", e)
-    return False, None, last_exc
-
-
 def extract_text_from_response(resp: Any) -> str:
-    """
-    Try to extract a human-readable text reply from various response shapes.
-    """
-    # Common shapes: resp.text, resp.result, resp.output_text, resp[0], str(resp)
     if resp is None:
         return ""
-    for attr in ("text", "result", "output_text", "content", "response"):
+    for attr in ("text", "result", "output_text", "content", "response", "output"):
         try:
             val = getattr(resp, attr, None)
             if val:
@@ -89,14 +64,12 @@ def extract_text_from_response(resp: Any) -> str:
         except Exception:
             pass
     try:
-        # some responses are dict-like
         if isinstance(resp, dict):
             for k in ("text", "result", "output", "content"):
                 if k in resp and resp[k]:
                     return str(resp[k])
     except Exception:
         pass
-    # fallback to string representation
     return str(resp)
 
 
@@ -120,7 +93,7 @@ def index():
         logging.exception("render_template failed: %s", exc)
         try:
             abs_path = Path(app.root_path) / "templates" / "index.html"
-            logging.info("Attempting static fallback path: %s", str(abs_path))
+            logging.info("Attempting static fallback: %s", str(abs_path))
             if abs_path.exists():
                 return send_file(str(abs_path))
             return ("index.html not found in container", 500)
@@ -137,9 +110,8 @@ def chat():
 
     if not message:
         return jsonify({"error": "missing 'message'"}), 400
-
     if GEMINI_API_KEY is None:
-        return jsonify({"error": "GEMINI_API_KEY not configured in environment."}), 500
+        return jsonify({"error": "GEMINI_API_KEY not configured"}), 500
 
     # Build messages structure
     messages = [{"role": "system", "parts": [{"text": SYSTEM_PROMPT}]}]
@@ -151,60 +123,37 @@ def chat():
     messages.append({"role": "user", "parts": [{"text": message}]})
 
     prompt = build_prompt_from_messages(messages)
-
     last_exc = None
-    # -------------- Try genai-level helper functions (various names & arg shapes) --------------
-    if genai is not None:
-        genai_fn_names = ["generate_text", "generate", "text_generation", "text", "generateText"]
-        for name in genai_fn_names:
-            fn = getattr(genai, name, None)
-            if callable(fn):
-                # try several arg shapes
-                arg_variants = [
-                    {"model": MODEL_NAME, "prompt": prompt},
-                    {"prompt": prompt, "model": MODEL_NAME},
-                    {"prompt": prompt},
-                    {"text": prompt},
-                    {"input": prompt},
-                    {"prompts": [prompt], "model": MODEL_NAME},
-                ]
-                success, resp, exc = _try_calls(fn, arg_variants)
-                if success:
+
+    # ----- First attempt: call _model.generate_content with 'contents' (log showed 'Did you mean contents' hint) -----
+    if _model is not None:
+        try:
+            # Try several 'contents' shapes commonly accepted:
+            attempts = [
+                {"contents": [prompt]},                      # simple list of strings
+                {"contents": [{"text": prompt}]},            # list of dicts with text
+                {"contents": [{"type": "text", "text": prompt}]},  # richer dict
+                {"contents": [{"input": prompt}]},           # alternate key name
+                {"contents": [{"content": prompt}]},         # alternate key name
+            ]
+            for args in attempts:
+                try:
+                    logging.info("Trying _model.generate_content with args: %s", args)
+                    resp = _model.generate_content(**args)
                     reply = extract_text_from_response(resp)
                     return jsonify({"reply": reply})
-                last_exc = exc
-
-    # -------------- Try model-level calls on _model (if available) --------------
-    if _model is not None:
-        # Try several ways to call generate_content / generate / generate_text
-        # 1) try generate_content with different shapes
-        try:
-            gen_fn = getattr(_model, "generate_content", None)
-            if callable(gen_fn):
-                arg_variants = [
-                    ({"messages": messages}),
-                    ({"input": messages}),
-                    ({"text": prompt}),
-                    ({"prompt": prompt}),
-                    ({"content": prompt}),
-                    ({"instances": [{"input": prompt}]})
-                ]
-                last_exc_here = None
-                for args in arg_variants:
-                    try:
-                        logging.info("Trying _model.generate_content with args: %s", args)
-                        resp = gen_fn(**args)
-                        reply = extract_text_from_response(resp)
-                        return jsonify({"reply": reply})
-                    except Exception as e:
-                        last_exc_here = e
-                        logging.info("generate_content attempt failed: %s", e)
-                last_exc = last_exc_here
+                except TypeError as te:
+                    logging.info("Signature mismatch for args %s: %s", args, te)
+                    last_exc = te
+                except Exception as e:
+                    logging.info("Attempt with args %s failed: %s", args, e)
+                    last_exc = e
         except Exception as e:
-            logging.exception("Error while trying _model.generate_content: %s", e)
+            logging.exception("Error in generate_content 'contents' attempts: %s", e)
             last_exc = e
 
-        # 2) try _model.generate(prompt=...)
+    # ----- Second attempt: try _model.generate or other model-level methods with the prompt -----
+    if _model is not None:
         try:
             if hasattr(_model, "generate"):
                 try:
@@ -215,8 +164,8 @@ def chat():
                 except Exception as e:
                     logging.info("_model.generate failed: %s", e)
                     last_exc = e
-            # 3) try other model-level method names
-            for method_name in ("generate_text", "generateText", "text_generation"):
+
+            for method_name in ("generate_text", "generateText", "text_generation", "create_text"):
                 mfn = getattr(_model, method_name, None)
                 if callable(mfn):
                     try:
@@ -228,42 +177,50 @@ def chat():
                         logging.info("%s failed: %s", method_name, e)
                         last_exc = e
         except Exception as e:
-            logging.exception("Model-level attempts raised: %s", e)
+            logging.exception("Model-level calls failed: %s", e)
             last_exc = e
 
-    # -------------- Last fallback: try a simple HTTP-style usage via genai if any client has a 'client' attr --------------
-    # e.g., some clients expose genai.Client() or genai.client
-    try:
-        client_candidates = []
-        if genai is not None:
-            for candidate_name in ("Client", "client", "GenAIClient"):
-                c = getattr(genai, candidate_name, None)
-                if c:
-                    client_candidates.append(c)
-        for cc in client_candidates:
+    # ----- Third attempt: genai-level helpers (various names and arg shapes) -----
+    if genai is not None:
+        genai_fn_names = ["generate_text", "generate", "text_generation", "generateText", "text"]
+        for name in genai_fn_names:
+            fn = getattr(genai, name, None)
+            if callable(fn):
+                arg_variants = [
+                    {"model": MODEL_NAME, "prompt": prompt},
+                    {"prompt": prompt, "model": MODEL_NAME},
+                    {"prompt": prompt},
+                    {"text": prompt},
+                    {"input": prompt},
+                    {"prompts": [prompt], "model": MODEL_NAME},
+                ]
+                for args in arg_variants:
+                    try:
+                        logging.info("Trying genai.%s with args: %s", name, args)
+                        resp = fn(**args)
+                        reply = extract_text_from_response(resp)
+                        return jsonify({"reply": reply})
+                    except Exception as e:
+                        logging.info("genai.%s with args %s failed: %s", name, args, e)
+                        last_exc = e
+
+    # ----- Final fallback: try a simple positional call to generate_content if available -----
+    if _model is not None:
+        try:
             try:
-                # try instantiating if callable
-                client = cc() if callable(cc) else cc
-                # try common method names
-                for method in ("generate_text", "generate", "text_generation"):
-                    m = getattr(client, method, None)
-                    if callable(m):
-                        try:
-                            logging.info("Trying client.%s(prompt=...)", method)
-                            resp = m(model=MODEL_NAME, prompt=prompt)
-                            reply = extract_text_from_response(resp)
-                            return jsonify({"reply": reply})
-                        except Exception as e:
-                            logging.info("client.%s attempt failed: %s", method, e)
-                            last_exc = e
+                logging.info("Trying positional _model.generate_content with single arg (prompt)")
+                resp = _model.generate_content(prompt)
+                reply = extract_text_from_response(resp)
+                return jsonify({"reply": reply})
             except Exception as e:
-                logging.info("Client candidate instantiation failed: %s", e)
+                logging.info("Positional generate_content failed: %s", e)
                 last_exc = e
-    except Exception:
-        pass
+        except Exception as e:
+            logging.exception("Final positional generate_content attempt raised: %s", e)
+            last_exc = e
 
     # Nothing worked
-    err_msg = "Could not call Gemini with available client methods. Check server logs for details."
+    err_msg = "Could not call Gemini with available client methods. Check server logs."
     if last_exc is not None:
         err_msg = f"{err_msg} Last exception: {type(last_exc).__name__}: {str(last_exc)}"
     logging.error(err_msg)
@@ -277,17 +234,17 @@ def _ls():
     dirs = [p.name for p in root.iterdir() if p.is_dir()]
     tdir = root / "templates"
     tfiles = [p.name for p in tdir.iterdir()] if tdir.exists() else []
-    info = {
+    genai_attrs = [] if genai is None else sorted([a for a in dir(genai) if not a.startswith("_")])[:200]
+    return jsonify({
         "cwd": str(root),
         "root_files": files,
         "root_dirs": dirs,
         "templates_files": tfiles,
-        "genai_attrs": [] if genai is None else sorted([a for a in dir(genai) if not a.startswith("_")])[:150],
-    }
-    return jsonify(info)
+        "genai_attrs": genai_attrs
+    })
 
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
-    
+        
